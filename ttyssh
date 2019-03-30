@@ -8,15 +8,17 @@ usage()
 ttyssh - ssh with tty (serial port) forwarding
 Options:
     [-h|--help] [-P|--local-port <45144>] [-p|--remote-port <45144>]
-    [-t </dev/ttyX>] [-T <target>] [--no-shell] [<ssh options>]
+    [-t </dev/ttyX>] [-T <target>] [-N|--no-shell] [--] [<ssh options>]
 
 Note: Please set baud rate locally BEFORE running ttyssh.
 Note: Using ssh ControlMaster is highly encouraged.
 Note: <target> will be evaluated in remote, so you may actually want to
-        use '\$HOME/tty' or '~/tty' instead of "\$HOME" or ~/tty.
+      use '\$HOME/tty' or '~/tty' instead of "\$HOME" or ~/tty.
 Note: <ssh options> can't contain commands, i.e.
-        tty <user>@<host> /bin/bash # WON'T work!!
-      To get rid of this, use --no-shell first and launch regular ssh.
+          \$ tty <user>@<host> /bin/bash # WON'T work!!
+      Workaround for this is to use --no-shell first and launch regular ssh.
+Note: If the first <ssh options> is in conflict with ttyssh's options,
+      simply append -- before all the <ssh options>.
 EOF
 }
 
@@ -50,9 +52,13 @@ while [ "$#" -gt "0" ]; do
             shift
             shift
             ;;
-        --no-shell)
+        -N|--no-shell)
             NOSHELL=YES
             shift
+            ;;
+        --)
+            shift
+            break
             ;;
         *)
             break
@@ -60,17 +66,28 @@ while [ "$#" -gt "0" ]; do
     esac
 done
 
-if [ ! -f "$TTYS" ]; then
-    echo "$TTYS not found" >&2
+which ssh >/dev/null
+if [ "$?" -ne "0" ]; then
+    echo "ssh not found in \$PATH on local system, please install" >&2
+    exit 63
+fi
+
+which socat >/dev/null
+if [ "$?" -ne "0" ]; then
+    echo "socat not found in \$PATH on local system, please install" >&2
+    exit 63
+fi
+
+if [ ! -c "$TTYS" ]; then
+    echo "$TTYS not found, or is not a tty" >&2
+    exit 66
 fi
 
 /bin/bash -s <<EOF &
     trap_int() {
-        echo "\$(date -Iseconds) \$\-\$CHILD  Caught SIGINT"
         kill -s SIGINT \$CHILD
     }
     trap_term() {
-        echo "\$(date -Iseconds) \$\$-\$CHILD Caught SIGTERM"
         kill -s SIGTERM \$CHILD
     }
     trap trap_int SIGINT
@@ -88,15 +105,21 @@ fi
 EOF
 LCHILD="$!"
 
-echo "Local Link $TTYS <-> localhost:$LOCAL_PORT by PID $LCHILD" >&2
+echo "Local Link $TTYS <-> local:$LOCAL_PORT by socat PID $LCHILD" >&2
 
 RCHILD=$(ssh "$@" /bin/bash -s <<EOF
+    which socat >/dev/null
+    if [ "\$?" -ne "0" ]; then
+        echo "socat not found in \\\$PATH on remote system, please install" >&2
+        exit 64
+    fi
     export LINK="$LINK"
     if [ -f "\$LINK.pid" ]; then
         kill -s SIGTERM \$(cat "\$LINK.pid")
         sleep 1
     fi
     if [ -f "\$LINK" ]; then
+        echo "\$LINK exists on remote system" >&2
         exit 114
     fi
     /bin/bash -s <<EEOF >>~/ttyfwd.log 2>&1 &
@@ -138,25 +161,30 @@ EOF
 )
 
 if [ -z "$RCHILD" ]; then
-    echo "$TARGET exists on remote system"
-    exit 114
+    echo -n "Exiting, kill $LCHILD on local..." >&2
+    kill -s SIGTERM "$LCHILD"
+    echo " $?"
+    wait "$LCHILD"
+    exit 11
 fi
 
-echo "Remote Link $LINK <-> localhost:$REMOTE_PORT by PID $RCHILD" >&2
+echo "Remote Link remote:$REMOTE_PORT <-> $LINK by socat PID $RCHILD" >&2
 
 RVARGS=("-R" "$REMOTE_PORT:localhost:$LOCAL_PORT")
 if [ -z "$NOSHELL" ]; then
-    echo "Running" ssh "${RVARGS[@]}" "$@"
+    echo "Tunnel Link local:$LOCAL_PORT <-> remote:$REMOTE_PORT by ssh" "$@" >&2
     ssh "${RVARGS[@]}" "$@"
 else
-    echo "Running" ssh "${RVARGS[@]}" "$@" -N
+    echo "Tunnel Link local:$LOCAL_PORT <-> remote:$REMOTE_PORT by ssh" "$@" -N >&2
+    echo "Forwarding up, Ctrl+C to terminate"
     ssh "${RVARGS[@]}" "$@" -N
 fi
 
-echo -n "Exiting, kill $RCHILD on remote..." >&2
+echo -n "Tear down remote link by kill $RCHILD on remote..." >&2
 ssh "$@" kill -s SIGTERM "$RCHILD"
 echo " $?"
-echo -n "Exiting, kill $LCHILD on local..." >&2
+echo -n "Tear down local link by kill $LCHILD on local..." >&2
 kill -s SIGTERM "$LCHILD"
 echo " $?"
 wait "$LCHILD"
+echo "Forwarding down, exit now"
