@@ -8,6 +8,8 @@ Tunnel your serial port over ssh!
 
 **Please set baud rate locally BEFORE running `ttyssh`.**
 
+**Using ssh ControlMaster is highly encouraged. A single `ttyssh` will call `ssh` three times so you may not want to authenticate three times.**
+
 ```sh
 ttyssh -t /dev/ttyUSB0 -T '$HOME/tty' <user>@<host>
 # Now in the remote shell, try

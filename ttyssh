@@ -1,0 +1,162 @@
+#!/bin/bash
+
+set -o pipefail
+
+usage()
+{
+    cat - <<EOF
+ttyssh - ssh with tty (serial port) forwarding
+Options:
+    [-h|--help] [-P|--local-port <45144>] [-p|--remote-port <45144>]
+    [-t </dev/ttyX>] [-T <target>] [--no-shell] [<ssh options>]
+
+Note: Please set baud rate locally BEFORE running ttyssh.
+Note: Using ssh ControlMaster is highly encouraged.
+Note: <target> will be evaluated in remote, so you may actually want to
+        use '\$HOME/tty' or '~/tty' instead of "\$HOME" or ~/tty.
+Note: <ssh options> can't contain commands, i.e.
+        tty <user>@<host> /bin/bash # WON'T work!!
+      To get rid of this, use --no-shell first and launch regular ssh.
+EOF
+}
+
+TTYS="/dev/ttyUSB0"
+REMOTE_PORT="23366"
+LOCAL_PORT="23366"
+LINK='$HOME/tty'
+while [ "$#" -gt "0" ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit
+            ;;
+        -P|--local-port)
+            LOCAL_PORT="$2"
+            shift
+            shift
+            ;;
+        -p|--remote-port)
+            REMOTE_PORT="$2"
+            shift
+            shift
+            ;;
+        -T|--target)
+            LINK="$2"
+            shift
+            shift
+            ;;
+        -t|--tty)
+            TTYS="$2"
+            shift
+            shift
+            ;;
+        --no-shell)
+            NOSHELL=YES
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ ! -f "$TTYS" ]; then
+    echo "$TTYS not found" >&2
+fi
+
+/bin/bash -s <<EOF &
+    trap_int() {
+        echo "\$(date -Iseconds) \$\-\$CHILD  Caught SIGINT"
+        kill -s SIGINT \$CHILD
+    }
+    trap_term() {
+        echo "\$(date -Iseconds) \$\$-\$CHILD Caught SIGTERM"
+        kill -s SIGTERM \$CHILD
+    }
+    trap trap_int SIGINT
+    trap trap_term SIGTERM
+    (trap 'kill -s SIGTERM \$CHILDX' EXIT;
+    while true; do
+        socat tcp4-listen:$LOCAL_PORT $(printf '%q' "$TTYS") &
+        CHILDX="\$!"
+        wait "\$CHILDX"
+        sleep 1
+    done) &
+    CHILD="\$!"
+    wait "\$CHILD"
+    exit "\$?"
+EOF
+LCHILD="$!"
+
+echo "Local Link $TTYS <-> localhost:$LOCAL_PORT by PID $LCHILD" >&2
+
+RCHILD=$(ssh "$@" /bin/bash -s <<EOF
+    export LINK="$LINK"
+    if [ -f "\$LINK.pid" ]; then
+        kill -s SIGTERM \$(cat "\$LINK.pid")
+        sleep 1
+    fi
+    if [ -f "\$LINK" ]; then
+        exit 114
+    fi
+    /bin/bash -s <<EEOF >>~/ttyfwd.log 2>&1 &
+        echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD Inner loop begin"
+        echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD LINK=\\\$LINK"
+        echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD REMOTE_PORT=$REMOTE_PORT"
+        trap_int() {
+            echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD Caught SIGINT"
+            kill -s SIGINT \\\$CHILD
+        }
+        trap_term() {
+            echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD Caught SIGTERM"
+            kill -s SIGTERM \\\$CHILD
+        }
+        trap trap_int SIGINT
+        trap trap_term SIGTERM
+        (trap 'kill -s SIGTERM \\\$CHILDX' EXIT;
+        while true; do
+            sleep 1
+            echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD Running" socat \
+                "PTY,link=\\\$LINK,raw,echo=0" \
+                "tcp4-connect:localhost:$REMOTE_PORT"
+            socat \
+                "PTY,link=\\\$LINK,raw,echo=0" \
+                "tcp4-connect:localhost:$REMOTE_PORT" &
+            CHILDX="\\\$!"
+            wait "\\\$CHILDX"
+            echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD-\\\$CHILDX Restarting because of \\\$?"
+        done) &
+        CHILD="\\\$!"
+        wait "\\\$CHILD"
+        RET="\\\$?"
+        echo "\\\$(date -Iseconds) \\\$\\\$-\\\$CHILD Exiting with \\\$RET"
+        rm -f "\\\$LINK.pid"
+        exit "\\\$RET"
+EEOF
+    echo "\$!" | tee "\$LINK.pid"
+EOF
+)
+
+if [ -z "$RCHILD" ]; then
+    echo "$TARGET exists on remote system"
+    exit 114
+fi
+
+echo "Remote Link $LINK <-> localhost:$REMOTE_PORT by PID $RCHILD" >&2
+
+RVARGS=("-R" "$REMOTE_PORT:localhost:$LOCAL_PORT")
+if [ -z "$NOSHELL" ]; then
+    echo "Running" ssh "${RVARGS[@]}" "$@"
+    ssh "${RVARGS[@]}" "$@"
+else
+    echo "Running" ssh "${RVARGS[@]}" "$@" -N
+    ssh "${RVARGS[@]}" "$@" -N
+fi
+
+echo -n "Exiting, kill $RCHILD on remote..." >&2
+ssh "$@" kill -s SIGTERM "$RCHILD"
+echo " $?"
+echo -n "Exiting, kill $LCHILD on local..." >&2
+kill -s SIGTERM "$LCHILD"
+echo " $?"
+wait "$LCHILD"
